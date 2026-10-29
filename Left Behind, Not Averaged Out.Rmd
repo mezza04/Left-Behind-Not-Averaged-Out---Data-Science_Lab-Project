@@ -1,0 +1,1605 @@
+---
+title: "Left Behind, Not Averaged Out — Final Pipeline"
+author: "Ilaria Anna Cesaratto, Chiara Mezzanzanica, Nicolò Nucci, Andrea Porro"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# How to read this document
+
+This file is the complete, executable pipeline of the project: it
+downloads seven youth-deprivation indicators from the OECD SDG API for
+24 European countries, fills residual gaps from Eurostat, cleans and
+orients the data, discretises it into ordinal deprivation grades, builds
+a partially ordered set (poset) of country profiles, and identifies
+which countries fall below a normative acceptability threshold — twice,
+with two independent implementations that are cross-checked against each
+other.
+
+## Loading the packages
+
+The next chunk loads every package used downstream: `httr` (API
+downloads), `readr`/`dplyr`/`tidyr`/`purrr` (data manipulation),
+`corrplot`/`pheatmap`/`ggplot2` (figures), `parsec` (the reference R
+implementation of poset-based deprivation measurement, by Fattore &
+Arcagni), `jsonlite` (final summary export) and `eurostat` (third-source
+fallback for permanent OECD data gaps).
+
+```{r setup}
+library(httr)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(corrplot)
+library(pheatmap)
+library(ggplot2)
+library(parsec)
+library(jsonlite)
+library(eurostat)
+```
+
+## Countries and indicators
+
+The next chunk declares the sample and the indicator set. The 24
+European countries are the project's declared scope (the discretisation
+later anchors cut-points to EU policy targets, so a European sample is a
+methodological requirement, not a convenience). Raw data is nevertheless
+downloaded for all OECD countries, so that exclusions can be verified on
+the data at every run instead of assumed. Seven indicators are declared,
+each with its SDG series code, age band, and orientation flag
+(`invert = TRUE` marks series that measure the *opposite* of deprivation
+at the source and must be flipped later).
+
+```{r config}
+# the 24 European countries that form the project's declared sample
+european_countries <- c("AUT", "BEL", "CHE", "CZE", "DEU", "DNK", "ESP", "EST",
+                        "FIN", "FRA", "GBR", "GRC", "HUN", "IRL", "ITA", "LTU",
+                        "LVA", "NLD", "NOR", "POL", "PRT", "SVK", "SVN", "SWE")
+
+# all OECD countries: downloaded too, so exclusions are verified, not assumed
+all_countries <- c(european_countries, "AUS", "CAN", "CHL", "ISR", "USA",
+                   "COL", "CRI", "ISL", "JPN", "KOR", "LUX", "MEX", "NZL", "TUR")
+
+# the seven indicators: SDG goal, series code, age band, orientation.
+# invert = TRUE marks "positive" series (they measure who is ABOVE a
+# minimum threshold, i.e. the opposite of deprivation)
+indicators <- tribble(
+  ~name,           ~goal, ~series,                                ~age,     ~invert,
+  "poverty",       1,     "1_2_1_OECD",                           "Y18T25", FALSE,
+  "neet",          8,     "8_6_1_SL_TLF_NEET_19ICLS",             "Y15T24", FALSE,
+  "unemp",         8,     "8_5_2_SL_TLF_UEM_19ICLS",              "Y15T24", FALSE,
+  "skill_math",    4,     "4_1_1_SE_TOT_PRFL_LOWSEC_SKILL_MATH",  "_T",     TRUE,
+  "skill_read",    4,     "4_1_1_SE_TOT_PRFL_LOWSEC_SKILL_READ",  "_T",     TRUE,
+  "early_leaving", 4,     "4_1_2_SE_TOT_CPLR_UPPSEC",             "_T",     TRUE,
+  "bank_acct",     8,     "8_10_2_FB_BNK_ACCSS",                  "Y15T24", TRUE
+)
+```
+
+*Result and decisions.* Four decisions about this indicator set were
+taken before any analysis, and are recorded here because they shape
+everything downstream. (1) `unemp` is included even though it overlaps
+definitionally with `neet` (every unemployed young person not in
+education is also NEET); whether the overlap is empirically excessive is
+decided later, in the cleaning step, from the data. (2) `early_leaving`
+is **not** what its name suggests: the EU "early school leavers, 18–24"
+indicator is a Eurostat structural indicator and does not exist in the
+UN SDG framework this API exposes. The closest series is SDG 4.1.2, the
+*upper-secondary completion rate*; it is used inverted, as a proxy, and
+renamed `low_completion` after inversion so the name never overclaims.
+Its `AGE = "_T"` is the series' own design (SDG completion indicators
+define their reference ages internally), not a mixing of all ages. (3) A
+mortality indicator (Goal 3) was attempted and dropped: two rounds of
+live API queries showed no youth-specific mortality series exists in
+this dataset, and every available proxy either broke the 15–24 framing
+or measured a different concept. Goal 3 is out rather than patched. (4)
+`skill_read` and `bank_acct` are downloaded but provisionally: the
+cleaning step decides their fate.
+
+## Downloading the raw data
+
+The next chunk downloads the raw data, one SDG goal at a time (goals 1,
+4, 8), from the OECD SDMX REST API, with three retries per call and a
+4-second pause between goals (the OECD rate limit is 20 requests per
+minute). Each goal is downloaded once even if several indicators use it.
+
+```{r download}
+download_goal <- function(goal) {
+  # the API wants countries sorted and joined with "+"; the 10 empty
+  # SDMX dimensions mean "all series, all ages, all sexes"
+  country_key <- paste(sort(all_countries), collapse = "+")
+  key <- paste0(country_key, strrep(".", 10))
+  url <- paste0(
+    "https://sdmx.oecd.org/public/rest/data/OECD.WISE.RSB,DSD_SDG@DF_SDG_G_",
+    goal, ",2.0/", key,
+    "?format=csvfilewithlabels&dimensionAtObservation=AllDimensions",
+    "&startPeriod=2013&endPeriod=2025"
+  )
+  for (attempt in 1:3) {
+    response <- GET(url, timeout(120))
+    if (status_code(response) == 200) break
+    Sys.sleep(5)   # transient overload: wait and retry
+  }
+  stopifnot(status_code(response) == 200)
+  read_csv(content(response, "text", encoding = "UTF-8"), show_col_types = FALSE)
+}
+
+raw_data_by_goal <- list()
+for (goal in unique(indicators$goal)) {
+  raw_data_by_goal[[as.character(goal)]] <- download_goal(goal)
+  Sys.sleep(4)   # respect the 20-requests-per-minute rate limit
+}
+```
+
+*Result.* Three raw tables (goals 1, 4, 8), 2013–2025, all OECD
+countries, all series. Nothing is filtered yet: filtering happens per
+indicator in the next chunk, and any failure there can be diagnosed
+against the full raw download.
+
+## Extracting one indicator at a time
+
+The next chunk filters each indicator out of its goal's raw table using
+SDMX dimension *codes* (`SDG_SERIES`, `AGE`, `SEX`), never text labels.
+A diagnostic helper prints what is actually available whenever a
+(series, age, sex) combination returns zero rows — the pipeline is built
+to fail loudly with actionable output rather than continue with an empty
+table. The two PISA series are restricted to actual PISA cycle years
+(2015, 2018, 2022), because the 4.1.1 dataflow mixes in non-PISA
+observations that are not comparable across countries.
+
+```{r filter}
+extract_indicator <- function(raw_data, series, age, sex = "_T") {
+  raw_data %>%
+    filter(SDG_SERIES == series) %>%
+    filter(AGE == age) %>%
+    filter(SEX == sex) %>%
+    select(iso3 = REF_AREA, year = TIME_PERIOD, value = OBS_VALUE) %>%
+    mutate(year = as.integer(year), value = as.numeric(value)) %>%
+    # if other breakdowns leave duplicates, keep one declared row rather
+    # than accidentally summing or averaging
+    distinct(iso3, year, .keep_all = TRUE)
+}
+
+# diagnostic: when a combination returns 0 rows, print what IS available
+diagnose_empty <- function(raw_data, series, age, goal, name, sex = "_T") {
+  series_in_goal <- sort(unique(raw_data$SDG_SERIES))
+  series_exists <- series %in% series_in_goal
+  cat(sprintf("\n[%s] series '%s' / AGE = '%s' / SEX = '%s' returned 0 rows (goal %s).\n",
+              name, series, age, sex, goal))
+  if (!series_exists) {
+    prefix <- sub("^([0-9]+_[0-9A-Za-z]+_[0-9]+).*", "\\1", series)
+    close_matches <- grep(paste0("^", prefix), series_in_goal, value = TRUE)
+    cat("  Series code not found among the", length(series_in_goal),
+        "series downloaded for goal", goal, ".\n")
+    if (length(close_matches) > 0) {
+      cat("  Series sharing the same SDG code prefix ('", prefix, "'):\n", sep = "")
+      print(close_matches)
+    } else {
+      cat("  All series available for this goal:\n")
+      print(series_in_goal)
+    }
+  } else {
+    series_rows <- raw_data %>% filter(SDG_SERIES == series)
+    cat("  Series exists, but not for AGE = '", age, "' / SEX = '", sex, "'.\n", sep = "")
+    cat("  AGE codes available:\n"); print(sort(unique(series_rows$AGE)))
+    cat("  SEX codes available:\n"); print(sort(unique(series_rows$SEX)))
+  }
+  invisible(series_exists)
+}
+
+all_indicators_data <- list()
+for (i in 1:nrow(indicators)) {
+  current_indicator <- indicators[i, ]
+  raw <- raw_data_by_goal[[as.character(current_indicator$goal)]]
+  df <- extract_indicator(raw, current_indicator$series, current_indicator$age)
+  if (nrow(df) == 0) {
+    diagnose_empty(raw, current_indicator$series, current_indicator$age,
+                   current_indicator$goal, current_indicator$name)
+  }
+  # PISA series: keep only real PISA cycles, other years are not comparable
+  if (current_indicator$name %in% c("skill_math", "skill_read")) {
+    df <- df %>% filter(year %in% c(2015, 2018, 2022))
+  }
+  df$indicator <- current_indicator$name
+  all_indicators_data[[i]] <- df
+}
+
+long_data <- bind_rows(all_indicators_data)
+
+# hard check: every declared indicator must have produced rows
+missing_series <- setdiff(indicators$name, unique(long_data$indicator))
+if (length(missing_series) > 0) {
+  stop("No data downloaded for: ", paste(missing_series, collapse = ", "),
+       " — see the diagnostic output above, then fix the `indicators` table.")
+}
+```
+
+## Eurostat fallback for permanent OECD gaps
+
+Some cells are missing from the OECD data in *every* year, not just
+recent ones. For four indicators a genuine Eurostat equivalent exists
+and is used as a third, last-resort source before a country is dropped:
+`neet` (`edat_lfse_20`), `unemp` (`une_rt_a`), `early_leaving`
+(`edat_lfse_14`), `poverty` (`ilc_li02`). The exact filter codes below
+were verified against live data (Italy 2024 values cross-checked against
+published figures), not guessed from documentation. `skill_math`,
+`skill_read` and `bank_acct` have no Eurostat equivalent (PISA and
+Global Findex are not replicated by Eurostat) and are excluded from the
+fallback on purpose.
+
+**Orientation warning — this is where the corrected bug originates.**
+Every Eurostat fallback series measures deprivation *directly* (share of
+NEET, share unemployed, share of early leavers, share at risk of
+poverty). The OECD series for `early_leaving`, however, is a
+*completion* rate, i.e. positively oriented, and the `{r orient}` chunk
+later inverts that whole column. A raw Eurostat early-leavers value
+dropped into that column would therefore be inverted *by mistake*. The
+`deprivation_oriented` flag added below lets the gap-filling step store
+such values pre-compensated (as `100 - value`), so the later uniform
+inversion restores them to their true meaning. For `neet`, `unemp` and
+`poverty` the OECD and Eurostat orientations agree and no compensation
+is needed.
+
+```{r eurostat-setup}
+# Eurostat geo codes are ISO2 with two exceptions: Greece "EL", UK "UK"
+eurostat_geo_map <- c(
+  AUT = "AT", BEL = "BE", CHE = "CH", CZE = "CZ", DEU = "DE", DNK = "DK",
+  ESP = "ES", EST = "EE", FIN = "FI", FRA = "FR", GBR = "UK", GRC = "EL",
+  HUN = "HU", IRL = "IE", ITA = "IT", LTU = "LT", LVA = "LV", NLD = "NL",
+  NOR = "NO", POL = "PL", PRT = "PT", SVK = "SK", SVN = "SI", SWE = "SE"
+)
+
+# dataset IDs + verified filter codes. deprivation_oriented = TRUE means
+# the Eurostat series already measures deprivation directly (all four do)
+eurostat_dataset_map <- list(
+  neet = list(id = "edat_lfse_20",
+              filters = list(age = "Y15-24", training = "NO_FE_NO_NFE",
+                             wstatus = "NEMP"),
+              deprivation_oriented = TRUE),   # NEET rate, Italy 2024 = 12.0%
+  unemp = list(id = "une_rt_a",
+               filters = list(age = "Y15-24", unit = "PC_ACT"),
+               deprivation_oriented = TRUE),  # unemployment rate, Italy 2024 = 20.3%
+  early_leaving = list(id = "edat_lfse_14",
+                       filters = list(age = "Y18-24", wstatus = "POP"),
+                       deprivation_oriented = TRUE), # EARLY LEAVERS share, Italy 2024 = 9.8%
+                       # NOTE: opposite orientation vs the OECD completion series!
+  poverty = list(id = "ilc_li02",
+                 filters = list(age = "Y18-24", unit = "PC",
+                                indic_il = "LI_R_MD60"),
+                 deprivation_oriented = TRUE) # AROP 60% median, Italy 2024 = 20.9%
+  # skill_math, skill_read, bank_acct: no Eurostat equivalent, not attempted
+)
+
+# resolve one (indicator, country) gap via Eurostat; NULL on failure,
+# printing exactly why (the same diagnose-first pattern as the OECD side)
+try_eurostat <- function(ind_name, ctry_iso3) {
+  if (!(ind_name %in% names(eurostat_dataset_map))) {
+    cat(sprintf("  No Eurostat equivalent registered for '%s' — skipping.\n", ind_name))
+    return(NULL)
+  }
+  geo_code <- eurostat_geo_map[[ctry_iso3]]
+  if (is.null(geo_code) || is.na(geo_code)) {
+    cat(sprintf("  No Eurostat geo code known for '%s' — skipping.\n", ctry_iso3))
+    return(NULL)
+  }
+  spec <- eurostat_dataset_map[[ind_name]]
+  all_filters <- c(list(geo = geo_code), spec$filters)
+
+  raw_eu <- tryCatch(
+    eurostat::get_eurostat(spec$id, filters = all_filters, time_format = "num"),
+    error = function(e) {
+      cat(sprintf("  Eurostat download failed for %s / %s: %s\n",
+                  spec$id, ctry_iso3, conditionMessage(e)))
+      NULL
+    }
+  )
+  if (is.null(raw_eu) || nrow(raw_eu) == 0) {
+    cat(sprintf("  Eurostat dataset %s returned no rows for %s.\n", spec$id, ctry_iso3))
+    return(NULL)
+  }
+  if ("TIME_PERIOD" %in% names(raw_eu) && !("time" %in% names(raw_eu))) {
+    raw_eu <- raw_eu %>% rename(time = TIME_PERIOD)
+  }
+  if ("sex" %in% names(raw_eu)) raw_eu <- raw_eu %>% filter(sex == "T")
+
+  # cap at 2024: Eurostat sometimes carries provisional current-year data
+  # that would silently sit one year ahead of every other cell
+  raw_eu <- raw_eu %>% filter(time <= 2024)
+  if (nrow(raw_eu) == 0) {
+    cat(sprintf("  %s / %s: no Eurostat data at or before 2024.\n", spec$id, ctry_iso3))
+    return(NULL)
+  }
+
+  # safety net: with the verified filters exactly one row per year should
+  # remain; if not, print everything and give up rather than guess
+  per_year <- raw_eu %>% count(time)
+  if (any(per_year$n > 1)) {
+    cat(sprintf("  UNEXPECTED AMBIGUITY: %s / %s has multiple rows per year — printing all:\n",
+                spec$id, ctry_iso3))
+    print(raw_eu)
+    return(NULL)
+  }
+
+  best <- raw_eu %>% filter(!is.na(values)) %>% filter(time == max(time))
+  if (nrow(best) != 1) {
+    cat(sprintf("  %s / %s: no non-NA value in any year.\n", spec$id, ctry_iso3))
+    return(NULL)
+  }
+  list(value = best$values[1], year = best$time[1],
+       deprivation_oriented = isTRUE(spec$deprivation_oriented))
+}
+```
+
+## From time series to a per-country matrix
+
+The next chunk collapses the time dimension to a cross-section (latest
+available year per country–indicator inside the primary 2019–2024 wind;
+(2) widened OECD window 2015–2024 — bounded, not "any year ever"; (3)
+Eurostat equivalent series, where one exists; (4) drop the country —
+last resort. Every step prints what it does, cell by cell, and writes to
+persistent logs that end in the final summary.
+
+**The corrected orientation handling is here.** When a cell is filled
+from Eurostat *and* the OECD column it lands in is scheduled for
+inversion in `{r orient}` (`invert = TRUE` in the `indicators` table),
+the Eurostat value — already deprivation-oriented — is stored as
+`100 - value`, so that the later uniform inversion restores it.
+
+```{r cross-section}
+# primary rule: latest available year within 2019-2024
+windowed_data <- long_data %>% filter(year >= 2019, year <= 2024)
+latest_data <- windowed_data %>%
+  group_by(iso3, indicator) %>%
+  filter(year == max(year)) %>%
+  ungroup()
+
+country_matrix <- latest_data %>%
+  select(iso3, indicator, value) %>%
+  pivot_wider(names_from = indicator, values_from = value)
+
+# print who is incomplete across the FULL sample (verify, don't assume)
+incomplete_countries <- country_matrix %>%
+  filter(if_any(everything(), is.na)) %>%
+  pull(iso3)
+cat("Countries with incomplete data in the 2019-2024 window: ",
+    if (length(incomplete_countries) > 0) paste(incomplete_countries, collapse = ", ") else "none",
+    "\n", sep = "")
+
+europe_matrix <- country_matrix %>% filter(iso3 %in% european_countries)
+
+gap_cells <- which(is.na(as.matrix(europe_matrix %>% select(-iso3))), arr.ind = TRUE)
+
+widen_log <- character(0)
+eurostat_fallback_log <- character(0)
+
+if (nrow(gap_cells) > 0) {
+  ind_names <- names(europe_matrix)[-1]
+  cat(sprintf("\nSearching for %d European country-indicator gap(s) in 2019-2024:\n",
+              nrow(gap_cells)))
+  for (k in seq_len(nrow(gap_cells))) {
+    ctry <- europe_matrix$iso3[gap_cells[k, "row"]]
+    ind  <- ind_names[gap_cells[k, "col"]]
+
+    # step 2: widen to 2015-2024 (bounded widening)
+    candidates <- long_data %>%
+      filter(iso3 == ctry, indicator == ind, year >= 2015, year <= 2024)
+    if (nrow(candidates) > 0) {
+      best <- candidates %>% filter(year == max(year))
+      cat(sprintf("  WIDENED: %s / %s -> using year %d (outside 2019-2024, within 2015-2024)\n",
+                  ctry, ind, best$year[1]))
+      europe_matrix[europe_matrix$iso3 == ctry, ind] <- best$value[1]
+      widen_log <- c(widen_log, sprintf("%s/%s: year %d (OECD, widened)", ctry, ind, best$year[1]))
+    } else {
+      # step 3: try Eurostat before giving up on the cell
+      cat(sprintf("  STILL MISSING in OECD data (2015-2024): %s / %s -> trying Eurostat...\n",
+                  ctry, ind))
+      eu_result <- try_eurostat(ind, ctry)
+      if (!is.null(eu_result)) {
+        # ORIENTATION FIX: if this column will be inverted later (the OECD
+        # series is positively oriented) but the Eurostat series already
+        # measures deprivation, store 100 - value so the later inversion
+        # restores the true value instead of corrupting it
+        will_be_inverted <- indicators$invert[indicators$name == ind]
+        value_to_store <- if (will_be_inverted && eu_result$deprivation_oriented) {
+          cat(sprintf("  ORIENTATION FIX: %s / %s: Eurostat value %.2f is deprivation-oriented, OECD column is completion-oriented -> storing %.2f (= 100 - value) so {r orient} restores it\n",
+                      ctry, ind, eu_result$value, 100 - eu_result$value))
+          100 - eu_result$value
+        } else {
+          eu_result$value
+        }
+        cat(sprintf("  EUROSTAT: %s / %s -> year %d, value %.2f (dataset %s — NOT the OECD series: check comparability)\n",
+                    ctry, ind, eu_result$year, eu_result$value,
+                    eurostat_dataset_map[[ind]]$id))
+        europe_matrix[europe_matrix$iso3 == ctry, ind] <- value_to_store
+        eurostat_fallback_log <- c(eurostat_fallback_log,
+                                   sprintf("%s/%s: year %d, dataset %s, raw value %.2f%s",
+                                           ctry, ind, eu_result$year,
+                                           eurostat_dataset_map[[ind]]$id,
+                                           eu_result$value,
+                                           if (will_be_inverted && eu_result$deprivation_oriented)
+                                             " (stored pre-compensated for inversion)" else ""))
+      } else {
+        cat(sprintf("  STILL MISSING: %s / %s -> no usable data anywhere. Country will be dropped.\n",
+                    ctry, ind))
+      }
+    }
+  }
+} else {
+  cat("\nNo widening needed: every European country has data in 2019-2024.\n")
+}
+
+# drop European countries still incomplete after all three sources
+country_removal_log <- character(0)
+incomplete_europe <- europe_matrix %>% filter(if_any(-iso3, is.na))
+if (nrow(incomplete_europe) > 0) {
+  for (i in seq_len(nrow(incomplete_europe))) {
+    ctry <- incomplete_europe$iso3[i]
+    row_flags <- is.na(as.matrix(incomplete_europe[i, -1, drop = FALSE]))
+    missing_inds <- names(incomplete_europe)[-1][as.vector(row_flags)]
+    cat(sprintf("DROPPED %s: no usable data anywhere for: %s\n",
+                ctry, paste(missing_inds, collapse = ", ")))
+    country_removal_log <- c(country_removal_log,
+                             sprintf("%s: missing %s", ctry, paste(missing_inds, collapse = ", ")))
+  }
+  europe_matrix <- europe_matrix %>% filter(!iso3 %in% incomplete_europe$iso3)
+} else {
+  cat("No European country dropped: all complete after the search.\n")
+}
+
+n_countries <- nrow(europe_matrix)
+cat(sprintf("\nFinal European sample: %d countries (out of %d listed)\n",
+            n_countries, length(european_countries)))
+```
+
+*Result and decisions.* On the reference run exactly four gaps survived
+the widened OECD search, all on `early_leaving` (the OECD completion
+series has no data at all for CZE, IRL, NLD, SVK), and all four were
+resolved from Eurostat `edat_lfse_14`, year 2024, with the orientation
+fix applied (raw early-leaver shares: CZE 5.4, IRL 2.8, NLD 7.0, SVK
+7.5). No cell needed the widened OECD window, and no country was
+dropped: the final sample is the full 24. Caveat, declared rather than
+hidden: those four cells measure the *EU early-leaver concept* (18–24,
+at most lower-secondary attainment, not in education), while the other
+20 cells of that column measure *non-completion of upper secondary* —
+conceptually adjacent but not identical, and the early-leaver measure is
+systematically lower. The four substituted countries are all well below
+every cut-point on this dimension, so their grade (0) is robust to this
+mismatch, but the mismatch itself is real and is carried into the limits
+section of the report.
+
+## Orienting the indicators
+
+The next chunk flips the four positively-oriented series (`100 - value`)
+so that in the final matrix **higher always means more deprivation**,
+and renames them so each name states what the column measures *after*
+inversion (`skill_math` becomes `lowskill_math`, `early_leaving` becomes
+`low_completion`, etc.).
+
+```{r orient}
+oriented_matrix <- europe_matrix %>%
+  mutate(
+    skill_math    = 100 - skill_math,
+    skill_read    = 100 - skill_read,
+    bank_acct     = 100 - bank_acct,
+    early_leaving = 100 - early_leaving
+  ) %>%
+  rename(lowskill_math  = skill_math,
+         lowskill_read  = skill_read,
+         no_bank_acct   = bank_acct,
+         low_completion = early_leaving)
+
+stopifnot(nrow(oriented_matrix) == n_countries)
+stopifnot(!any(is.na(select(oriented_matrix, -iso3))))
+cat(sprintf("Matrix before cleaning: %d x %d indicators\n",
+            n_countries, ncol(oriented_matrix) - 1))
+```
+## Automatic cleaning step
+
+Two removals of two different kinds happen next. Rule (1) is
+**pre-registered** (decided before looking at results): drop
+`no_bank_acct` if it is nearly saturated across Europe (financial
+inclusion in advanced economies approaches 96–99% per the World Bank
+Global Findex 2021, so the indicator may not discriminate). Step (2) is
+**not pre-registered and is flagged as such**: the full pairwise
+Spearman correlation matrix of the surviving indicators is plotted
+first, and `lowskill_read` and `no_bank_acct` are then removed manually,
+based on what the matrix shows. This is a weaker standard than rule (1)
+— a post-hoc pick, declared plainly instead of dressed up as a rule.
+Everything removed is logged with its reason.
+
+```{r auto-clean, fig.width=6.5, fig.height=5.5}
+removal_log <- character(0)
+
+# --- 1. pre-registered: drop no_bank_acct if nearly saturated ---
+# threshold scales with n_countries so it keeps meaning ~5/8 of the sample
+near_zero_bank_threshold <- ceiling(15 / 24 * n_countries)
+n_near_zero_bank <- sum(oriented_matrix$no_bank_acct < 2, na.rm = TRUE)
+cat(sprintf("Countries with no_bank_acct < 2%%: %d / %d (threshold: %d)\n",
+            n_near_zero_bank, n_countries, near_zero_bank_threshold))
+if (n_near_zero_bank >= near_zero_bank_threshold) {
+  cat(sprintf("REMOVED no_bank_acct: %d/%d countries below 2%% (near-saturation).\n",
+              n_near_zero_bank, n_countries))
+  oriented_matrix <- oriented_matrix %>% select(-no_bank_acct)
+  removal_log <- c(removal_log,
+                   sprintf("no_bank_acct: saturation (%d/%d countries < 2%%)",
+                           n_near_zero_bank, n_countries))
+}
+
+# --- 2. NOT pre-registered: inspect the full matrix, then decide ---
+rho_threshold <- 0.6
+surviving <- setdiff(names(oriented_matrix), "iso3")
+
+cor_mat_before <- cor(oriented_matrix %>% select(all_of(surviving)),
+                      method = "spearman", use = "complete.obs")
+cat("\nFull pairwise Spearman correlation matrix:\n")
+print(round(cor_mat_before, 2))
+corrplot(cor_mat_before, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.8,
+         tl.col = "black", tl.srt = 45,
+         title = "Spearman correlation - all indicators",
+         mar = c(0, 0, 1, 0))
+
+# manual removal, decided AFTER inspecting the matrix above (post-hoc,
+# flagged as such); intersect() guards against already-removed columns
+to_drop_manual <- intersect(c("lowskill_read", "no_bank_acct"), surviving)
+if (length(to_drop_manual) > 0) {
+  cat("REMOVED (manual, post-hoc decision after inspecting the matrix):",
+      paste(to_drop_manual, collapse = ", "), "\n")
+  removal_log <- c(removal_log,
+                   sprintf("%s: removed manually after inspecting the correlation matrix (post-hoc)",
+                           to_drop_manual))
+  oriented_matrix <- oriented_matrix %>% select(-all_of(to_drop_manual))
+  surviving <- setdiff(surviving, to_drop_manual)
+}
+
+# re-plot after removal. NOTE: a manual pick does NOT guarantee every
+# remaining pair sits below rho_threshold — nothing enforces that here
+if (length(surviving) >= 2) {
+  cor_mat_after <- cor(oriented_matrix %>% select(all_of(surviving)),
+                       method = "spearman", use = "complete.obs")
+  print(round(cor_mat_after, 2))
+  corrplot(cor_mat_after, method = "color", type = "upper",
+           addCoef.col = "black", number.cex = 0.8,
+           tl.col = "black", tl.srt = 45,
+           title = "Spearman correlation - remaining indicators",
+           mar = c(0, 0, 1, 0))
+}
+
+final_indicators <- setdiff(names(oriented_matrix), "iso3")
+n_dims <- length(final_indicators)
+cat(sprintf("\nIndicators after cleaning: %d\n", n_dims))
+cat(paste(final_indicators, collapse = ", "), "\n")
+
+write_csv(oriented_matrix, "idea5_matrix_oriented_R.csv")
+```
+
+*Result and decisions.* Five indicators survive: `poverty`, `neet`,
+`unemp`, `lowskill_math`, `low_completion`. `lowskill_read` was removed
+because it tracks `lowskill_math` closely enough to add little
+independent information; `no_bank_acct` because in Europe it separates
+only a small Mediterranean tail. Both removals are the manual, post-hoc
+kind and the log says so — a deliberate weakening of the
+pre-registration standard used elsewhere, on explicit request, declared
+rather than disguised. `unemp`, whose overlap with `neet` motivated its
+removal in an earlier six-indicator version, stays: on this sample their
+correlation (0.42) is below the 0.6 bar.
+
+## Exploratory analysis: why a poset at all
+
+The empirical premise of the whole project: if the surviving indicators
+were strongly correlated, a plain average would lose almost nothing and
+the poset machinery would be unjustified. The next chunks compute
+summary statistics, a boxplot, a value heatmap, the full Spearman
+correlation matrix, and the best/worst country per indicator.
+
+```{r explore-setup}
+indicator_values <- oriented_matrix %>% select(-iso3)
+```
+
+```{r summary-stats}
+summary_stats <- indicator_values %>%
+  summarise(across(everything(),
+                   list(min = min, median = median, max = max, sd = sd),
+                   .names = "{.col}__{.fn}")) %>%
+  pivot_longer(everything(), names_to = c("indicator", "stat"),
+               names_sep = "__") %>%
+  pivot_wider(names_from = stat, values_from = value)
+print(summary_stats)
+```
+
+```{r boxplot}
+indicator_values %>%
+  pivot_longer(everything(), names_to = "indicator", values_to = "value") %>%
+  ggplot(aes(indicator, value)) +
+  geom_boxplot(fill = "#e7f5ff", colour = "#1c7ed6", outlier.colour = "#c92a2a") +
+  labs(x = NULL, y = "value (oriented: higher = more deprivation)",
+       title = "Distribution of the indicators") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r matrix-heatmap}
+value_matrix <- as.matrix(indicator_values)
+rownames(value_matrix) <- oriented_matrix$iso3
+pheatmap(value_matrix,
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         scale = "column",
+         display_numbers = TRUE, number_format = "%.1f", fontsize_number = 6,
+         main = sprintf("Deprivation matrix (%d countries x %d indicators)",
+                        n_countries, n_dims))
+```
+
+```{r explore}
+corr_matrix <- cor(indicator_values, method = "spearman")
+print(round(corr_matrix, 2))
+off_diagonal <- corr_matrix[upper.tri(corr_matrix)]
+median_abs_corr <- median(abs(off_diagonal))
+cat("Median |rho| between indicators:", round(median_abs_corr, 2), "\n")
+corrplot(corr_matrix, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.8,
+         tl.col = "black", tl.srt = 45,
+         title = "Spearman correlation between indicators",
+         mar = c(0, 0, 1, 0))
+```
+
+```{r best-worst}
+worst_country <- sapply(indicator_values, function(col) oriented_matrix$iso3[which.max(col)])
+cat("Worst country per indicator:\n"); print(worst_country)
+best_country <- sapply(indicator_values, function(col) oriented_matrix$iso3[which.min(col)])
+cat("Best country per indicator:\n"); print(best_country)
+```
+
+*Result.* On the corrected matrix the median absolute Spearman
+correlation is **0.27**; the strongest pair is poverty–low_completion
+(0.57), still below the 0.6 bar. Maxima of deprivation are scattered —
+Norway worst on poverty, Lithuania on NEET, Greece on unemployment and
+mathematics, Denmark on non-completion; Ireland is best on poverty and
+completion, Estonia on mathematics. No country is best or worst
+everywhere: the dimensions carry genuinely different information, which
+is precisely the empirical premise the poset needs.
+
+## Ordinal discretisation
+
+Each indicator is mapped to three deprivation grades (0 = low, 1 =
+medium, 2 = high). The placement of the cut-points is the most
+attackable choice of the whole project, so it is made twice, with two
+schemes whose comparison is itself a result.
+
+**Schema A (main) — policy-anchored cut-points, with three declared
+levels of anchoring.** Each threshold is one of: an **official EU
+target** (institutional objective at EU level), an **empirical anchor**
+(calibrated on EU averages or baselines), or a **normative convention**
+(the author's declared choice, guided by the literature). Indicator by
+indicator:
+
+-   **NEET** — 9 [official EU target]: the European Pillar of Social
+    Rights Action Plan (COM(2021) 102 final, adopted at the Porto Social
+    Summit 2021) targets a NEET rate (15–29) below 9% by 2030. 12
+    [empirical anchor]: the pre-pandemic 2019 EU baseline (12.6%) that
+    the same Action Plan names as the critical starting level. The
+    indicator here covers 15–24 rather than 15–29; the Council
+    Recommendation on the reinforced Youth Guarantee (2020/C 372/01)
+    confirms 15–24 as the historical core of EU youth policy, and the
+    mismatch is declared.
+-   **Low achievers in mathematics (PISA)** — 15 [official EU target]:
+    the Council Resolution on the European Education Area strategic
+    framework (2021/C 66/01) targets fewer than 15% low-achieving
+    15-year-olds by 2030. 30 [normative convention / empirical anchor]:
+    twice the official target, clearly above the post-PISA-2022 EU
+    average (\~22.9%, OECD PISA 2022 Results), marking severe
+    educational distress.
+-   **Youth poverty (AROP)** — no official EU percentage target exists
+    (the EPSR poverty target is absolute: −15 million AROPE persons), so
+    both cuts are anchored differently. 20 [empirical anchor]: the EU
+    average at-risk-of-poverty rate for young people (15–29) is \~19.3%
+    (Eurostat, EU-SILC). 10 [normative convention]: about half the EU
+    average, isolating best performers. Declared caveat: the OECD series
+    used here follows the OECD 50%-of-median convention while the
+    Eurostat AROP statistic is 60%-of-median, so the empirical anchor is
+    approximate and conservative.
+-   **Youth unemployment** — the EPSR sets no isolated
+    youth-unemployment target. 20 [empirical anchor]: clearly above the
+    EU 15–24 average (\~14.5% in 2023, Eurostat EU-LFS), typical of
+    structurally critical labour markets. 10 [normative convention]:
+    below the EU average, isolating stable youth labour markets.
+-   **Low completion** — 9 and 15 [normative convention]: the lower cut
+    borrows the EU early-leavers target (\<9%, EPSR/EEA framework) as
+    the nearest institutional anchor. Declared limit, kept deliberately:
+    the measured concept (100 − upper-secondary completion) is
+    systematically larger than the EU early-leaver share, so these cuts
+    are *stricter* in practice than the target they borrow from —
+    several well-performing countries land in grade 1–2 on this
+    dimension. This is a conscious, declared choice, not an oversight.
+-   **No bank account** (removed in cleaning, cuts kept for
+    completeness) — 5 [empirical anchor]: World Bank Global Findex 2021
+    shows 96–99% account access in advanced economies, so \>5% unbanked
+    marks an anomalous friction (coherent with World Bank UFA2020 and UN
+    SDG 8.10); 10 [normative convention]: twice the residual
+    physiological level.
+
+**Schema B (robustness)** uses terciles of the observed distribution —
+purely relative, no policy content: "worse than European peers" instead
+of "short of EU targets".
+
+```{r schema-a}
+# cut-points for all SEVEN pre-cleaning indicators; the filter below
+# keeps only the survivors. Anchoring per cut is documented above.
+cuts_a <- tribble(
+  ~indicator,      ~cut_low, ~cut_high,
+  "poverty",        10,       20,   # normative / EU youth AROP mean ~19.3%
+  "neet",           9,        12,   # EPSR Action Plan target / 2019 EU baseline
+  "unemp",          10,       20,   # normative / above EU youth mean ~14.5%
+  "lowskill_math",  15,       30,   # EEA Council Resolution target / 2x target
+  "lowskill_read",  15,       30,   # same anchors as math (removed in cleaning)
+  "low_completion", 9,        15,   # EU early-leaver target borrowed as proxy anchor
+  "no_bank_acct",   5,        10    # Findex saturation / 2x (removed in cleaning)
+)
+
+cuts_a <- cuts_a %>% filter(indicator %in% final_indicators)
+stopifnot(setequal(cuts_a$indicator, final_indicators))
+
+discretize_policy <- function(values, cut_low, cut_high) {
+  case_when(
+    values > cut_high ~ 2,
+    values > cut_low  ~ 1,
+    TRUE              ~ 0
+  )
+}
+
+grades_a <- oriented_matrix
+for (i in 1:nrow(cuts_a)) {
+  cut_row <- cuts_a[i, ]
+  grades_a[[cut_row$indicator]] <- discretize_policy(
+    oriented_matrix[[cut_row$indicator]], cut_row$cut_low, cut_row$cut_high
+  )
+}
+```
+
+*Result.* Grade counts per indicator are printed two chunks below. Two
+facts worth noting now: only **Estonia** (14.97) meets the EU 15%
+low-achievers target in mathematics, and on `lowskill_math` 20 of 24
+countries sit in the medium band — the EU-level target is demanding for
+nearly everyone.
+
+```{r schema-b}
+discretize_terciles <- function(values) {
+  breakpoints <- quantile(values, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+  breakpoints <- unique(breakpoints)   # merge duplicated breakpoints
+  as.integer(cut(values, breaks = breakpoints, include.lowest = TRUE,
+                 labels = FALSE)) - 1
+}
+grades_b <- oriented_matrix %>%
+  mutate(across(-iso3, discretize_terciles))
+```
+
+```{r discretisation-check}
+count_grades <- function(grades_df) {
+  grades_df %>%
+    select(-iso3) %>%
+    pivot_longer(everything(), names_to = "indicator", values_to = "grade") %>%
+    count(indicator, grade) %>%
+    pivot_wider(names_from = grade, values_from = n, values_fill = 0)
+}
+cat("Grade counts, Schema A (policy):\n");   print(count_grades(grades_a))
+cat("\nGrade counts, Schema B (terciles):\n"); print(count_grades(grades_b))
+
+cat("\nCountries meeting the EU low-achievers target (lowskill_math grade 0):\n")
+print(grades_a$iso3[grades_a$lowskill_math == 0])
+
+write_csv(grades_a, "idea5_grades_A_R.csv")
+write_csv(grades_b, "idea5_grades_B_R.csv")
+```
+
+*Result (reference run, Schema A).* poverty 9/12/3, neet 13/6/5, unemp
+5/14/5, lowskill_math 1/20/3, low_completion 11/6/7 (grades 0/1/2
+respectively). Every grade class is populated for every indicator, so no
+dimension is degenerate.
+
+## From-scratch poset toolbox
+
+The analysis is deliberately run twice: once with the from-scratch
+implementation below (profile construction, component-wise dominance,
+transitive reduction, Bubley–Dyer adjacent-transposition sampling of
+linear extensions — the same Markov chain `parsec` uses), and once with
+`parsec` itself. If the scratch code is right, the two identification
+vectors must be nearly identical; the cross-check happens further down.
+
+```{r scratch-implementation}
+# collapse rows sharing the same grade vector into distinct profiles
+distinct_profiles <- function(grades) {
+  key <- apply(grades, 1, paste, collapse = "")
+  uk <- unique(key)
+  profiles <- do.call(rbind, lapply(uk, function(k)
+    as.integer(strsplit(k, "")[[1]])))
+  members <- lapply(uk, function(k) rownames(grades)[key == k])
+  list(profiles = profiles, members = members)
+}
+
+# leq[i, j] TRUE when profile i <= profile j on EVERY dimension
+leq_matrix <- function(profiles) {
+  m <- nrow(profiles)
+  leq <- matrix(FALSE, m, m)
+  for (i in seq_len(m)) for (j in seq_len(m))
+    leq[i, j] <- all(profiles[i, ] <= profiles[j, ])
+  leq
+}
+
+# transitive reduction: the cover pairs = edges of the Hasse diagram
+cover_relation <- function(leq) {
+  m <- nrow(leq)
+  strict <- leq & !diag(m)
+  out <- list()
+  for (i in seq_len(m)) for (j in seq_len(m))
+    if (strict[i, j] && !any(strict[i, ] & strict[, j]))
+      out[[length(out) + 1]] <- c(i, j)
+  do.call(rbind, out)
+}
+
+# depth = length of the longest chain strictly below each node
+node_depths <- function(strict) {
+  m <- nrow(strict)
+  depth <- rep(0L, m)
+  for (pass in seq_len(m)) for (i in seq_len(m)) {
+    below <- which(strict[, i])
+    if (length(below)) depth[i] <- 1L + max(depth[below])
+  }
+  depth
+}
+
+# topological sort: the Bubley-Dyer chain must start from a valid extension
+topo_sort <- function(strict) {
+  m <- nrow(strict)
+  indeg <- as.integer(colSums(strict))
+  avail <- which(indeg == 0L)
+  out <- integer(0)
+  while (length(avail)) {
+    x <- avail[length(avail)]
+    avail <- avail[-length(avail)]
+    out <- c(out, x)
+    for (j in which(strict[x, ])) {
+      indeg[j] <- indeg[j] - 1L
+      if (indeg[j] == 0L) avail <- c(avail, j)
+    }
+  }
+  stopifnot(length(out) == m)   # otherwise not a partial order
+  out
+}
+
+# Bubley-Dyer sampler: random adjacent transpositions, kept only when
+# they do not violate the partial order; returns one row of ranks per sample
+sample_les <- function(leq, n_samples, burn_in, thin, seed) {
+  set.seed(seed)
+  m <- nrow(leq)
+  strict <- leq & !diag(m)
+  seqv <- topo_sort(strict)
+  total <- burn_in + n_samples * thin
+  pos <- sample.int(m - 1, total, replace = TRUE)
+  coin <- runif(total) < 0.5
+  ranks <- matrix(0L, n_samples, m)
+  s <- 0L
+  for (t in seq_len(total)) {
+    if (coin[t]) {
+      i <- pos[t]
+      a <- seqv[i]; b <- seqv[i + 1]
+      if (!strict[a, b]) { seqv[i] <- b; seqv[i + 1] <- a }
+    }
+    if (t > burn_in && (t - burn_in) %% thin == 0L) {
+      s <- s + 1L
+      ranks[s, seqv] <- 0:(m - 1)
+    }
+  }
+  ranks
+}
+
+# full evaluation: profiles + tau, sample extensions, per unit compute
+# identification (share of extensions ranking it ABOVE tau), severity
+# (mean normalised rank gap above tau) and average rank.
+# Convention: a unit exactly AT tau counts as deprived (idn = 1)
+evaluate_scratch <- function(grades, tau,
+                             n_samples = 20000, burn_in = 5000,
+                             thin = 5, seed = 42) {
+  dp <- distinct_profiles(grades)
+  profiles <- dp$profiles
+  members <- dp$members
+  hit <- which(apply(profiles, 1, function(p) all(p == tau)))
+  if (length(hit) == 0) {
+    profiles <- rbind(profiles, tau)
+    members <- c(members, list("_TAU_"))
+    tau_idx <- nrow(profiles)
+  } else tau_idx <- hit[1]
+  leq <- leq_matrix(profiles)
+  ranks <- sample_les(leq, n_samples, burn_in, thin, seed)
+  m <- nrow(profiles)
+  idn <- colMeans(ranks > ranks[, tau_idx])
+  sev <- colMeans(pmax(ranks - ranks[, tau_idx], 0)) / (m - 1)
+  avg_rank <- colMeans(ranks)
+  idn[tau_idx] <- 1
+  rows <- do.call(rbind, lapply(seq_along(members), function(i) {
+    mem <- setdiff(members[[i]], "_TAU_")
+    if (length(mem) == 0) return(NULL)
+    data.frame(unit = mem, idn = idn[i], severity = sev[i],
+               avg_rank = avg_rank[i])
+  }))
+  rows <- rows[match(rownames(grades), rows$unit), ]
+  rownames(rows) <- rows$unit
+  rows[, c("idn", "severity", "avg_rank")]
+}
+
+# share of country pairs whose profiles are incomparable
+incomparable_share <- function(grades) {
+  v <- as.matrix(grades)
+  n <- nrow(v)
+  inc <- 0L
+  for (i in 1:(n - 1)) for (j in (i + 1):n)
+    if (!(all(v[i, ] <= v[j, ]) || all(v[i, ] >= v[j, ]))) inc <- inc + 1L
+  inc / (n * (n - 1) / 2)
+}
+```
+
+*Result.* A self-contained toolbox; nothing has touched the real data
+yet. Its correctness is established next, on posets with exactly known
+answers.
+
+The next chunk validates the sampler on two tiny posets where the answer
+is known exactly: a "V" poset (a \< c, b \< c — a must precede b in
+exactly half of all extensions, c is always last) and a 3-element
+antichain (all ranks uniform).
+
+```{r sampler-checks}
+leq_v <- matrix(c(TRUE, FALSE, TRUE,
+                  FALSE, TRUE, TRUE,
+                  FALSE, FALSE, TRUE), 3, 3, byrow = TRUE)
+r <- sample_les(leq_v, 20000, 5000, 5, seed = 1)
+stopifnot(abs(mean(r[, 1] < r[, 2]) - 0.5) < 0.03,
+          all(r[, 3] == 2))
+r <- sample_les(diag(3) == 1, 20000, 5000, 5, seed = 2)
+stopifnot(all(abs(colMeans(r) - 1) < 0.04))
+cat("Bubley-Dyer sampler checks passed\n")
+```
+
+*Result.* Both checks pass; the sampler produces uniform linear
+extensions within Monte-Carlo tolerance.
+
+## parsec setup check
+
+```{r api-smoke-test}
+# smallest non-trivial poset: two variables, two grades each
+toy_profiles <- var2prof(varlen = c(2, 2))
+print(toy_profiles$profiles)
+
+toy_result <- evaluation(toy_profiles, threshold = "12")
+print(round(toy_result$idn_f, 2))
+
+# hand-computed: "11" below the threshold in both extensions -> 1;
+# "12" is the threshold -> 1; "21" incomparable, below in 1 of 2 -> 0.5;
+# "22" always above -> 0
+expected <- c("11" = 1, "12" = 1, "21" = 0.5, "22" = 0)
+stopifnot(isTRUE(all.equal(unname(toy_result$idn_f[names(expected)]),
+                           unname(expected), tolerance = 0.1)))
+cat("parsec is set up correctly: matches the hand-computed values.\n")
+
+# second orientation check, on rank_dist (used later for average ranks):
+# measure the direction on this toy poset instead of assuming it
+m_toy <- ncol(toy_result$rank_dist)
+toy_avg_rank <- as.vector(toy_result$rank_dist %*% seq_len(m_toy))
+names(toy_avg_rank) <- rownames(toy_result$rank_dist)
+print(round(toy_avg_rank, 2))
+rank_dist_needs_flip <- unname(toy_avg_rank["11"] > toy_avg_rank["22"])
+cat("rank_dist orientation: rank 1 =",
+    if (rank_dist_needs_flip) "MOST deprived -> flip needed before use\n"
+    else "least deprived -> no flip needed\n")
+```
+
+*Result and decisions.* The toy case reveals that `parsec`'s `idn_f` is
+the share of extensions ranking a profile *at or below* the threshold —
+the mirror image of what this project calls identification. So on the
+real data identification is `1 - idn_f`, and severity is `wea_rel` (not
+`svr_rel`). The `rank_dist` orientation is likewise *measured* here, not
+assumed, and the measured flag drives the average ranks used in the
+composite comparison. Both catches came from this toy test, not from
+guessing.
+
+## Poset construction and identification (parsec)
+
+The next chunks apply `parsec` to the real Schema A grades: build the
+distinct observed profiles, embed the threshold profile, compute the
+poset's structure, then estimate identification and severity against
+$\tau = (1, \dots, 1)$ — the profile of a country in the medium band on
+every surviving dimension at once.
+
+**Why** $\tau = (1, \dots, 1)$, stated in full. The threshold is an
+explicitly *normative* choice, not a statistical one. The literature on
+ordinal multidimensional deprivation (Fattore 2016; Alkire & Foster
+2011) is explicit that the cutoff is a value judgment that must be
+declared transparently and stress-tested — which is what the robustness
+section does. Reading countries as "at distance from normative target
+levels" mirrors the OECD's own distance-to-target methodology for the
+SDGs. And identifying against a profile rather than an aggregate score
+is what lets the poset avoid the compensability assumption embedded in
+every composite index (Ravallion 2012; Decancq & Lugo 2013; OECD/JRC
+Handbook 2008). Under Schema A, $\tau$ reads: *at the EU target
+boundary, or inside the declared tolerance band, on all five fronts at
+once* — dominated profiles are unambiguously acceptable, dominating
+profiles unambiguously not, and the incomparable middle is measured
+rather than assumed away.
+
+```{r real-profiles}
+# parsec wants grades starting at 1, not 0
+grades_a_parsec <- grades_a %>% mutate(across(-iso3, ~ . + 1))
+
+country_profile_label <- grades_a_parsec %>%
+  select(-iso3) %>%
+  apply(1, paste0, collapse = "")
+
+# threshold label built from n_dims, never hard-coded
+threshold_label <- paste(rep(2L, n_dims), collapse = "")
+
+observed_profiles <- pop2prof(grades_a_parsec %>% select(-iso3))
+cat(sprintf("Distinct profiles among the %d countries: %d\n",
+            n_countries, nrow(observed_profiles$profiles)))
+
+# add the threshold as ONE weight-0 phantom row. Never merge the full
+# theoretical support (3^n_dims profiles) just to place tau: the sampler's
+# chain length grows ~n^5 with the number of profiles
+threshold_row <- as.data.frame(as.list(rep(2L, n_dims)))
+names(threshold_row) <- names(grades_a_parsec %>% select(-iso3))
+augmented_data <- bind_rows(grades_a_parsec %>% select(-iso3), threshold_row)
+augmented_weights <- c(rep(1, nrow(grades_a_parsec)), 0)
+all_profiles <- pop2prof(augmented_data, weights = augmented_weights)
+cat("Profiles after adding the threshold (if new):", nrow(all_profiles$profiles), "\n")
+
+stopifnot(threshold_label %in% rownames(all_profiles$profiles))
+```
+
+*Result.* On the reference run the 24 countries collapse to **18
+distinct profiles** (ties: AUT–GBR–LTU; CHE–CZE–SVN; BEL–IRL; FRA–POL);
+$\tau = 11111$ (parsec encoding `22222`) is not observed and enters as a
+19th, weight-0 profile.
+
+```{r poset-structure}
+# structure on the REAL country profiles only (not the tau placeholder)
+zeta <- getzeta(observed_profiles)
+profile_heights <- heights(zeta)
+cat("Poset height:", max(profile_heights), "\n")
+profile_levels <- levels(zeta)
+cat("Poset width:", max(table(profile_levels)), "\n")
+incomparable <- incomp(zeta)
+share_incomparable <- mean(incomparable[upper.tri(incomparable)])
+cat("Share of incomparable profile pairs:", round(share_incomparable, 3), "\n")
+```
+
+*Result.* Height 6, width 5, and **56% of distinct profile pairs are
+incomparable** (44% when counted over country pairs, since ties
+concentrate in the comparable bottom). More than half of the profile
+comparisons the data allows are refusals to compare — this is the
+structural fact the whole project is about.
+
+```{r identification}
+result <- evaluation(all_profiles, threshold = threshold_label, error = 1e-3)
+
+# flip idn_f (measured on the toy poset above, not assumed)
+deprivation_idn <- 1 - result$idn_f
+severity <- result$wea_rel
+
+country_results <- tibble(
+  iso3 = grades_a$iso3,
+  profile = country_profile_label,
+  idn = deprivation_idn[country_profile_label],
+  severity = severity[country_profile_label]
+) %>% arrange(desc(idn), desc(severity))
+
+print(country_results, n = n_countries)
+
+cat("\nCertainly deprived (idn = 1):\n")
+print(country_results %>% filter(idn == 1) %>% pull(iso3))
+```
+
+*Result.* Five countries are **certainly deprived** — their profiles
+dominate $\tau$, so they rank above it in *every* admissible ranking:
+**Spain, Italy, Austria, Lithuania, United Kingdom** (AUT, GBR and LTU
+share one profile). Severity separates them: Spain (\~0.46) and Italy
+(\~0.41) are far past the boundary; the AUT/GBR/LTU profile (\~0.20)
+just past. Norway (\~0.95), Greece (\~0.91) and Sweden (\~0.90) are
+near-certain but saved from certainty by a single good dimension each.
+Nine countries have idn = 0.
+
+## Scratch vs parsec cross-check
+
+The same Schema A grades now go through the from-scratch toolbox, and
+the two identification vectors are compared. This is the strongest
+internal correctness check available: two independent implementations of
+the same mathematics must agree.
+
+```{r scratch-vs-parsec}
+GA <- as.data.frame(grades_a %>% select(-iso3))
+rownames(GA) <- grades_a$iso3
+TAU <- rep(1L, n_dims)
+
+scratch_results <- evaluate_scratch(GA, TAU)
+
+cross_check <- country_results %>%
+  select(iso3, idn_parsec = idn) %>%
+  left_join(tibble(iso3 = rownames(scratch_results),
+                   idn_scratch = scratch_results$idn),
+            by = "iso3")
+print(cross_check, n = n_countries)
+
+rho_cross <- cor(cross_check$idn_scratch, cross_check$idn_parsec,
+                 method = "spearman")
+cat(sprintf("Cross-check scratch vs parsec — Spearman rho: %.4f\n", rho_cross))
+stopifnot(rho_cross >= 0.95)   # in practice it should exceed 0.99
+```
+
+*Result.* On the reference run the agreement exceeds 0.99 — the
+from-scratch implementation reproduces the reference one. This check
+must hold on every re-run regardless of the data; if it ever fails, the
+bug is in the code, not in the countries.
+
+```{r idn-severity-plot, fig.width=6.4, fig.height=5.6}
+pr <- country_results %>% arrange(idn, severity) %>%
+  mutate(iso3 = factor(iso3, levels = iso3))
+ggplot(pr) +
+  geom_col(aes(idn, iso3), fill = "#1c7ed6", alpha = 0.85) +
+  geom_col(aes(severity, iso3), fill = "#c92a2a", width = 0.45) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey40") +
+  labs(x = "identification (blue) and severity (red)", y = NULL,
+       title = "Identification degree and severity — Schema A") +
+  theme_minimal()
+```
+
+```{r hasse, fig.width=8.6, fig.height=6.4}
+# Hasse diagram: nodes = distinct profiles (labelled with their countries),
+# edges = cover relation, height = depth in the poset, tau in red
+dp_h <- distinct_profiles(GA)
+profiles_h <- rbind(dp_h$profiles, TAU)
+members_h <- c(dp_h$members, list("_TAU_"))
+leq_h <- leq_matrix(profiles_h)
+strict_h <- leq_h & !diag(nrow(leq_h))
+tau_idx_h <- nrow(profiles_h)
+depth_h <- node_depths(strict_h)
+cov_edges <- cover_relation(leq_h)
+
+nodes <- data.frame(id = seq_len(nrow(profiles_h)), depth = depth_h,
+                    key = apply(profiles_h, 1, paste, collapse = ""))
+nodes$label <- sapply(members_h, function(mm)
+  if (identical(mm, "_TAU_")) "tau" else paste(mm, collapse = ","))
+nodes$is_tau <- seq_len(nrow(profiles_h)) == tau_idx_h
+nodes <- nodes[order(nodes$depth, nodes$key), ]
+nodes$x <- ave(seq_along(nodes$id), nodes$depth,
+               FUN = function(k) (seq_along(k) - (length(k) + 1) / 2) * 1.35)
+nodes <- nodes[order(nodes$id), ]
+edges <- data.frame(x = nodes$x[cov_edges[, 1]],
+                    y = nodes$depth[cov_edges[, 1]],
+                    xend = nodes$x[cov_edges[, 2]],
+                    yend = nodes$depth[cov_edges[, 2]])
+
+ggplot() +
+  geom_segment(data = edges, aes(x, y, xend = xend, yend = yend),
+               colour = "grey60", linewidth = 0.4) +
+  geom_label(data = nodes,
+             aes(x, depth, label = label, fill = is_tau, colour = is_tau),
+             size = 2.8, label.padding = unit(0.15, "lines"),
+             show.legend = FALSE) +
+  scale_fill_manual(values = c(`FALSE` = "#e7f5ff", `TRUE` = "#c92a2a")) +
+  scale_colour_manual(values = c(`FALSE` = "black", `TRUE` = "white")) +
+  labs(x = NULL, y = "deprivation level (upward = worse)",
+       title = "Hasse diagram — profile poset with threshold tau (red)") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        panel.grid = element_blank(),
+        plot.title = element_text(size = 11))
+```
+
+*Result.* The diagram makes the certain set visible at a glance: the
+five certainly-deprived countries occupy the nodes above the red $\tau$
+node; the nine idn-0 countries the nodes below it; everything else hangs
+beside it, incomparable.
+
+## Composite index comparison
+
+The alternative the poset argues against is now built fairly and simply:
+min-max normalise the five oriented indicators, average them, rank. Any
+divergence between this ranking and the poset's is then attributable to
+the aggregation logic, not to exotic modelling.
+
+```{r composite}
+normalised <- as.data.frame(lapply(indicator_values,
+                                   function(x) (x - min(x)) / (max(x) - min(x))))
+composite_score <- rowMeans(normalised)
+
+# poset average rank from rank_dist, flipped only if the toy-poset
+# measurement said so
+rownames(result$rank_dist) <- rownames(all_profiles$profiles)
+m_real <- ncol(result$rank_dist)
+poset_avg_rank_by_profile <- as.vector(result$rank_dist %*% seq_len(m_real))
+if (rank_dist_needs_flip) {
+  poset_avg_rank_by_profile <- m_real + 1 - poset_avg_rank_by_profile
+}
+names(poset_avg_rank_by_profile) <- rownames(result$rank_dist)
+poset_avg_rank <- poset_avg_rank_by_profile[country_profile_label]
+```
+
+```{r composite-compare, fig.width=6, fig.height=5.6}
+comparison <- tibble(
+  iso3 = grades_a$iso3,
+  idn = deprivation_idn[country_profile_label],
+  severity = severity[country_profile_label],
+  composite = composite_score,
+  rank_poset = rank(poset_avg_rank),
+  rank_composite = rank(composite_score)
+) %>%
+  mutate(rank_shift = rank_composite - rank_poset) %>%
+  arrange(desc(idn))
+print(comparison, n = n_countries)
+
+rho_poset_composite <- cor(comparison$rank_poset, comparison$rank_composite,
+                           method = "spearman")
+cat("Spearman(poset rank, composite rank):", round(rho_poset_composite, 3), "\n")
+
+ggplot(comparison, aes(rank_composite, rank_poset)) +
+  geom_abline(colour = "grey80") +
+  geom_point(colour = "#1c7ed6", size = 2) +
+  geom_text(aes(label = iso3,
+                colour = abs(rank_shift) >= 3,
+                fontface = ifelse(abs(rank_shift) >= 3, "bold", "plain")),
+            size = 2.7, nudge_x = 0.6, show.legend = FALSE) +
+  scale_colour_manual(values = c(`FALSE` = "black", `TRUE` = "#c92a2a")) +
+  labs(x = "composite-index rank (1 = least deprived)",
+       y = "poset average rank (1 = least deprived)",
+       title = sprintf("Spearman rho = %.2f", rho_poset_composite)) +
+  theme_minimal()
+
+cat("\nLargest rank shifts (composite minus poset):\n")
+print(comparison %>%
+        arrange(desc(abs(rank_shift))) %>%
+        select(iso3, idn, severity, rank_poset, rank_composite, rank_shift) %>%
+        head(8))
+```
+
+*Result.* The two rankings correlate at **rho = 0.85**: the poset does
+not produce noise. The disagreements are the point. **Austria** shifts 9
+positions (9th for the composite, 18th for the poset) and the **UK** 8:
+both are *certainly deprived* yet the average dilutes their critical
+NEET configuration with good poverty and unemployment numbers.
+**Denmark** shifts 9 positions the other way: the composite punishes its
+high non-completion value, while the poset keeps it genuinely ambiguous
+(idn \~0.47) because its NEET grade 0 blocks dominance. This is exactly
+the class of information a single score erases.
+
+## Robustness
+
+Six checks, one per attackable choice: drop one indicator at a time
+(jackknife on indicators), drop one country at a time (jackknife on
+countries), replace Schema A with Schema B, change the number of grade
+levels (3 vs 5), test whether the observed incomparability could arise
+by chance (permutation test), and identify which dimensions block
+certain identification (bottleneck analysis).
+
+```{r jackknife-helper}
+# repeated everywhere below: build profiles, embed threshold, evaluate.
+# Mirrors exactly the main Schema A steps
+identify_countries <- function(grades_tbl, threshold_grades) {
+  parsec_grades <- grades_tbl %>% mutate(across(-iso3, ~ . + 1))
+  label <- parsec_grades %>% select(-iso3) %>% apply(1, paste0, collapse = "")
+  threshold_label <- paste0(threshold_grades + 1, collapse = "")
+  threshold_row <- as.data.frame(as.list(threshold_grades + 1))
+  names(threshold_row) <- names(parsec_grades %>% select(-iso3))
+  augmented <- bind_rows(parsec_grades %>% select(-iso3), threshold_row)
+  weights <- c(rep(1, nrow(parsec_grades)), 0)
+  profiles <- pop2prof(augmented, weights = weights)
+  stopifnot(threshold_label %in% rownames(profiles$profiles))
+  res <- evaluation(profiles, threshold = threshold_label, error = 1e-3)
+  idn <- 1 - res$idn_f
+  tibble(iso3 = grades_tbl$iso3, idn = as.numeric(idn[label]))
+}
+```
+
+```{r jackknife}
+indicator_names <- setdiff(names(grades_a), "iso3")
+
+jackknife_results <- lapply(indicator_names, function(drop_col) {
+  keep_cols <- c("iso3", setdiff(indicator_names, drop_col))
+  reduced_grades <- grades_a[keep_cols]
+  reduced_tau <- rep(1L, length(keep_cols) - 1)
+  identify_countries(reduced_grades, reduced_tau) %>%
+    rename(!!paste0("idn_no_", drop_col) := idn)
+}) %>% reduce(left_join, by = "iso3")
+
+print(jackknife_results, n = n_countries)
+write_csv(jackknife_results, "idea5_jackknife_idn_R.csv")
+
+idn_cols <- setdiff(names(jackknife_results), "iso3")
+jackknife_range <- jackknife_results %>%
+  rowwise() %>%
+  mutate(jk_min = min(c_across(all_of(idn_cols))),
+         jk_max = max(c_across(all_of(idn_cols)))) %>%
+  ungroup()
+cat("\nCountries whose identification flips across jackknife folds:\n")
+print(jackknife_range %>% filter(jk_min < 0.5, jk_max > 0.5) %>%
+        select(iso3, jk_min, jk_max))
+```
+
+*Result.* The certain core is solid: the five idn-1 countries stay at 1
+in every fold, and the nine idn-0 countries stay at 0. The middle is
+honest about its fragility: eight countries (DNK, DEU, EST, FIN, HUN,
+PRT, SVK, SWE) cross 0.5 in at least one fold — e.g. Hungary sits
+exactly one dimension (poverty) below $\tau$, so dropping poverty sends
+it to 1 and dropping its worst dimension sends it to 0. With five
+dimensions, each fold removes 20% of the information; wide ranges in the
+ambiguous middle are the expected behaviour, not a defect.
+
+```{r jackknife-countries, fig.width=6.4, fig.height=5.6}
+country_list <- grades_a$iso3
+jk_countries <- lapply(country_list, function(drop_iso) {
+  reduced <- grades_a %>% filter(iso3 != drop_iso)
+  res <- identify_countries(reduced, rep(1L, n_dims))
+  res %>% mutate(dropped = drop_iso)
+}) %>% bind_rows()
+
+jk_country_range <- jk_countries %>%
+  group_by(iso3) %>%
+  summarise(jk_min = min(idn), jk_max = max(idn), .groups = "drop") %>%
+  left_join(country_results %>% select(iso3, idn_full = idn), by = "iso3") %>%
+  arrange(desc(idn_full))
+print(jk_country_range, n = n_countries)
+
+ggplot(jk_country_range %>%
+         mutate(iso3 = factor(iso3, levels = iso3[order(idn_full)]))) +
+  geom_segment(aes(x = jk_min, xend = jk_max, y = iso3, yend = iso3),
+               colour = "grey60", linewidth = 2.2, alpha = 0.6) +
+  geom_point(aes(idn_full, iso3), colour = "#1c7ed6", size = 2) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey40") +
+  labs(x = "identification degree", y = NULL,
+       title = "Country jackknife: idn range when one country is dropped") +
+  theme_minimal()
+```
+
+*Result.* Removing any single country moves the others' identification
+by a few hundredths at most; no country's classification depends on the
+presence of another. Certainty (idn = 1 or 0) is untouched by
+construction — dominance relations against $\tau$ do not depend on the
+rest of the sample.
+
+```{r schema-b-compare, fig.width=6.4, fig.height=5.6}
+result_b <- identify_countries(grades_b, rep(1L, n_dims))
+
+schema_compare <- country_results %>%
+  select(iso3, idn_a = idn) %>%
+  left_join(result_b %>% rename(idn_b = idn), by = "iso3")
+
+rho_a_b <- cor(schema_compare$idn_a, schema_compare$idn_b, method = "spearman")
+cat("Spearman(idn Schema A, idn Schema B):", round(rho_a_b, 3), "\n")
+
+cat("\nIdentified (idn > 0.5), Schema A:\n")
+print(sort(schema_compare$iso3[schema_compare$idn_a > 0.5]))
+cat("\nIdentified (idn > 0.5), Schema B:\n")
+print(sort(schema_compare$iso3[schema_compare$idn_b > 0.5]))
+
+schema_compare_long <- schema_compare %>%
+  pivot_longer(c(idn_a, idn_b), names_to = "schema", values_to = "idn") %>%
+  mutate(schema = recode(schema,
+                         "idn_a" = "Schema A (policy)",
+                         "idn_b" = "Schema B (terciles)"),
+         iso3 = factor(iso3, levels = schema_compare$iso3[order(schema_compare$idn_a)]))
+ggplot(schema_compare_long, aes(idn, iso3, colour = schema, shape = schema)) +
+  geom_point(size = 2.5) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(NULL, values = c("Schema A (policy)" = "#1c7ed6",
+                                       "Schema B (terciles)" = "#f08c00")) +
+  scale_shape_manual(NULL, values = c(16, 15)) +
+  labs(x = "identification degree", y = NULL,
+       title = sprintf("Schema A vs B — Spearman rho = %.2f", rho_a_b)) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+*Result.* Agreement is moderate (**rho \~0.60**) — by design, not by
+failure: policy-anchored and relative cut-points answer different
+questions. France is the textbook divergence: acceptable against EU
+target bands (idn 0 under A) but among the worst against European
+terciles (idn 1 under B) — mediocre on nearly everything, critical on
+nothing. The certain Schema A core stays identified under B too.
+
+```{r sensitivity-levels, fig.width=6, fig.height=4.4}
+discretize_quintiles <- function(values) {
+  breakpoints <- quantile(values, probs = seq(0, 1, by = 0.2), na.rm = TRUE)
+  breakpoints <- unique(breakpoints)
+  as.integer(cut(values, breaks = breakpoints,
+                 include.lowest = TRUE, labels = FALSE)) - 1L
+}
+grades_c <- oriented_matrix %>% mutate(across(-iso3, discretize_quintiles))
+TAU_5 <- rep(2L, n_dims)
+result_c <- identify_countries(grades_c, TAU_5)
+cat("Identified (idn > 0.5), Schema C (quintiles):\n")
+print(sort(result_c$iso3[result_c$idn > 0.5]))
+
+inc_a <- incomparable_share(grades_a %>% select(-iso3))
+inc_b <- incomparable_share(grades_b %>% select(-iso3))
+inc_c <- incomparable_share(grades_c %>% select(-iso3))
+comparison_levels <- tibble(
+  schema = c("A — policy (3 levels)", "B — terciles (3 levels)",
+             "C — quintiles (5 levels)"),
+  levels = c(3, 3, 5),
+  pct_incomparable = c(inc_a, inc_b, inc_c)
+)
+print(comparison_levels)
+
+ggplot(comparison_levels, aes(schema, pct_incomparable, fill = schema)) +
+  geom_col(show.legend = FALSE, width = 0.5) +
+  scale_fill_manual(values = c("#1c7ed6", "#f08c00", "#2b8a3e")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = NULL, y = "% incomparable country pairs",
+       title = "Incomparability grows with the number of levels") +
+  theme_minimal()
+```
+
+*Result.* Incomparability among country pairs: **44% (A) → 53% (B) → 67%
+(C)**. Finer scales create more refusals to compare, as expected:
+incomparability is partly a resolution choice, which is one more reason
+to declare the discretisation openly.
+
+```{r permutation-test, fig.width=6, fig.height=4.4}
+# null model: permute each column independently — marginals preserved,
+# associations between indicators destroyed
+set.seed(42)
+n_perm <- 1000
+obs_inc <- incomparable_share(grades_a %>% select(-iso3))
+perm_inc <- replicate(n_perm, {
+  G_perm <- grades_a %>%
+    select(-iso3) %>%
+    mutate(across(everything(), sample))
+  incomparable_share(G_perm)
+})
+p_value <- mean(perm_inc >= obs_inc)
+
+cat(sprintf("Observed incomparability:          %.3f\n", obs_inc))
+cat(sprintf("Mean under the null (permutation): %.3f ± %.3f\n",
+            mean(perm_inc), sd(perm_inc)))
+cat(sprintf("p-value (observed >= null):        %.3f\n", p_value))
+
+if (p_value < 0.05) {
+  cat("Incomparability significantly GREATER than chance: dimensions move independently.\n")
+} else if (p_value > 0.95) {
+  cat("Incomparability significantly SMALLER than chance: the poset is more\n")
+  cat("ordered than random data — the dimensions are positively associated.\n")
+} else {
+  cat("Incomparability compatible with chance alone.\n")
+}
+
+tibble(perm = perm_inc) %>%
+  ggplot(aes(perm)) +
+  geom_histogram(bins = 40, fill = "grey70", colour = "white") +
+  geom_vline(xintercept = obs_inc, colour = "#c92a2a", linewidth = 1.2) +
+  annotate("text", x = obs_inc + 0.01, y = n_perm / 20,
+           label = sprintf("Observed\n%.3f", obs_inc),
+           colour = "#c92a2a", hjust = 0, size = 3.5) +
+  labs(x = "% incomparable pairs (permutations)", y = "frequency",
+       title = "Permutation test: is the incomparability structural?") +
+  theme_minimal()
+```
+
+*Result — read carefully, the sign matters.* Observed incomparability
+(0.44) is significantly *below* the null mean (0.64, p ≈ 1 for the
+"greater" direction). The poset is **more ordered than random data**:
+the five dimensions are positively associated (deprivations cluster in
+the same countries), which creates more dominance than independence
+would. The honest reading is therefore *not* "the dimensions are
+independent" — it is that even with this positive association, 44% of
+country pairs remain incomparable: real structure *and* a large
+irreducible zone where any complete ranking is an act of weighting.
+
+```{r bottleneck, fig.width=6.4, fig.height=4.4}
+# which dimensions sit BELOW tau for each country? Those grades are what
+# saves a country from certain identification
+tau_vec <- rep(1L, n_dims)
+dim_names <- setdiff(names(grades_a), "iso3")
+
+bottleneck_results <- grades_a %>%
+  rowwise() %>%
+  mutate(
+    n_blocks = sum(c_across(all_of(dim_names)) < tau_vec),
+    block_label = {
+      blocks <- dim_names[c_across(all_of(dim_names)) < tau_vec]
+      if (length(blocks) == 0) "none (certainly deprived)"
+      else paste(blocks, collapse = ", ")
+    }
+  ) %>%
+  ungroup() %>%
+  left_join(country_results %>% select(iso3, idn), by = "iso3") %>%
+  arrange(desc(idn)) %>%
+  select(iso3, idn, n_blocks, block_label)
+print(bottleneck_results, n = n_countries)
+
+block_freq <- bottleneck_results %>%
+  filter(n_blocks > 0) %>%
+  separate_rows(block_label, sep = ", ") %>%
+  count(block_label, sort = TRUE) %>%
+  rename(dimension = block_label, n_blocking = n)
+cat("\nDimensions blocking dominance (number of countries each):\n")
+print(block_freq)
+
+ggplot(block_freq, aes(reorder(dimension, n_blocking), n_blocking)) +
+  geom_col(fill = "#1c7ed6", alpha = 0.85) +
+  coord_flip() +
+  labs(x = NULL, y = "countries where this dimension blocks dominance",
+       title = "Bottleneck analysis: what prevents certain identification?") +
+  theme_minimal()
+```
+
+*Result.* NEET blocks dominance most often (13 countries have grade 0 on
+it), followed by low completion (11) and poverty (9); `lowskill_math`
+blocks only once (Estonia) — because almost nobody meets the EU maths
+target, that dimension rarely saves anyone. Norway, Greece and Sweden
+illustrate the mechanism: each is kept off certainty by exactly one
+grade-0 dimension.
+
+## Interpretation and output
+
+The last chunk computes nothing new: it collects the headline numbers
+into one summary object, writes it to JSON, and lists the files this
+document produces.
+
+```{r summary}
+summary_list <- list(
+  poset_structure_A = list(
+    height = max(profile_heights),
+    width = max(table(profile_levels)),
+    share_incomparable = round(share_incomparable, 3)
+  ),
+  spearman_poset_composite = round(rho_poset_composite, 3),
+  spearman_idn_A_B = round(rho_a_b, 3),
+  spearman_scratch_parsec = round(rho_cross, 4),
+  certainly_deprived_A = sort(country_results$iso3[country_results$idn == 1]),
+  identified_A = sort(schema_compare$iso3[schema_compare$idn_a > 0.5]),
+  identified_B = sort(schema_compare$iso3[schema_compare$idn_b > 0.5]),
+  indicators_removed = removal_log,
+  n_indicators_final = n_dims,
+  countries_removed = country_removal_log,
+  n_countries_final = n_countries,
+  cells_widened_oecd = widen_log,
+  cells_from_eurostat = eurostat_fallback_log,
+  perm_test = list(
+    observed_incomparable = round(obs_inc, 3),
+    null_mean = round(mean(perm_inc), 3),
+    p_value = p_value
+  ),
+  sensitivity_levels = list(
+    schema_a_3levels = round(inc_a, 3),
+    schema_b_3levels = round(inc_b, 3),
+    schema_c_5levels = round(inc_c, 3)
+  )
+)
+print(summary_list)
+write_json(summary_list, "idea5_summary_R.json", pretty = TRUE, auto_unbox = TRUE)
+
+cat("\nFiles produced by this document:\n")
+for (f in c("idea5_matrix_oriented_R.csv", "idea5_grades_A_R.csv",
+            "idea5_grades_B_R.csv", "idea5_jackknife_idn_R.csv",
+            "idea5_summary_R.json")) {
+  cat(" ", f, "\n")
+}
+```
+
+# Limits that hold regardless of the exact numbers
+
+The sample is "Europe", not the OECD, by construction (the cut-points
+anchor to EU policy). Reference years are not aligned across indicators
+(PISA 2022, Findex 2021, labour data 2023–24; documented cell by cell),
+and the four Eurostat-substituted `low_completion` cells are a different
+measurement concept from the OECD cells in the same column — logged
+individually, with the orientation compensation, in
+`cells_from_eurostat`. Age brackets differ across indicators (15–24,
+18–25, 15-year-olds). The poverty line is nationally relative, so high
+Nordic values reflect within-country relative disadvantage, not low
+absolute living standards. `low_completion` borrows an early-leaver
+target as its cut anchor while measuring non-completion, making those
+cuts stricter than the target they cite. And both $\tau$ and the Schema
+A cut-points are normative choices — declared, referenced, and
+stress-tested above, which is the method's honesty, not its weakness:
+composite indices make equivalent choices implicitly, through weights
+nobody defends.
