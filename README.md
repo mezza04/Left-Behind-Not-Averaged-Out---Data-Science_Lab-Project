@@ -110,3 +110,4 @@ AI tools were used to support code development; all methodological choices, data
 - Fattore, M. (2016). *Partially ordered sets and the measurement of multidimensional ordinal deprivation.* Social Indicators Research, 128, 835–858.
 - Fattore, M., & Arcagni, A. (2014). *PARSEC: An R package for poset-based evaluation of multidimensional poverty.*
 - Bubley, R., & Dyer, M. (1999). *Faster random generation of linear extensions.* Discrete Mathematics, 201, 81–88.
+
